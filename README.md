@@ -137,7 +137,9 @@ Transcripts store **token counts, not dollars**. `ccq` prices them with publishe
 per-million-token rates (`src/ccq/pricing.py`) and the standard cache multipliers
 (cache write 1.25×, cache read 0.10×). Two honest caveats:
 
-1. **Estimates, not invoices**: unknown/`<synthetic>` models price to `$0`.
+1. **Estimates, not invoices**: an unlisted model falls back to its family rate
+   (`opus`/`sonnet`/`haiku`/`fable`, generation-aware where tiers differ); names with
+   no Claude family word (`<synthetic>`, non-Claude) price to `$0`.
 2. **Main-loop only**: a subagent's spend is **not** in the transcript. The only
    signal that survives is `toolUseResult.totalTokens` (no input/output split, so it
    can't be priced). `ccq agents` surfaces those token totals **separately**; they

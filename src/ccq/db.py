@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import duckdb
 
-from ccq.pricing import CACHE_READ_MULT, CACHE_WRITE_MULT, pricing_rows
+from ccq.pricing import CACHE_READ_MULT, CACHE_WRITE_MULT, pricing_rows, tier_case_sql
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -87,11 +87,15 @@ def _glob(projects_dir: Path) -> str:
 
 
 def _views_sql() -> str:
+    # Effective price: the exact model_pricing row if joined, else the family-tier
+    # fallback, else 0. Same fallback table as pricing.cost_for, so the two agree.
+    in_price = f"COALESCE(p.in_price, {tier_case_sql('u.model', 'input_per_mtok')}, 0)"
+    out_price = f"COALESCE(p.out_price, {tier_case_sql('u.model', 'output_per_mtok')}, 0)"
     cost_expr = (
-        "(u.input_tokens * COALESCE(p.in_price, 0)"
-        f" + u.cache_creation_tokens * COALESCE(p.in_price, 0) * {CACHE_WRITE_MULT}"
-        f" + u.cache_read_tokens * COALESCE(p.in_price, 0) * {CACHE_READ_MULT}"
-        " + u.output_tokens * COALESCE(p.out_price, 0)) / 1e6"
+        f"(u.input_tokens * {in_price}"
+        f" + u.cache_creation_tokens * {in_price} * {CACHE_WRITE_MULT}"
+        f" + u.cache_read_tokens * {in_price} * {CACHE_READ_MULT}"
+        f" + u.output_tokens * {out_price}) / 1e6"
     )
     return rf"""
 -- Every line, common scalar fields. No numeric casts here (keep the base scan safe).
