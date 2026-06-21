@@ -19,6 +19,33 @@ claude-sonnet-4-6           6,789     901,234,567    8,400,000      612.30
 ...
 ```
 
+A few more angles: your most-used tools, and the full timeline of any one session.
+
+```
+$ ccq tools
+tool_name    calls  sessions  projects
+----------  ------  --------  --------
+Bash         4,210       210       48
+Read         2,980       198       45
+Edit         1,740       142       40
+Agent          410        88       24
+```
+
+```
+$ ccq session a1b2c3d4
+session  a1b2c3d4-9f02-4c7e-bb31-0e5a6d7c8e90
+project  demo-app   branch main
+span     2026-06-01 10:00 -> 10:42  (42 min, 88 messages)
+models   claude-opus-4-8, claude-sonnet-4-6
+est cost $4.21
+------------------------------------------------------------
+ts          kind        detail
+10:00:05    prompt      refactor the duckdb loader
+10:01:12    tool:Bash   uv run pytest -q
+10:03:48    tool:Edit   src/ccq/db.py
+10:07:20    ERROR 429   claude-opus-4-8
+```
+
 ## Install
 
 ```bash
