@@ -39,6 +39,40 @@ PRICING: dict[str, ModelPrice] = {
     "claude-fable-5": ModelPrice(10.0, 50.0),
 }
 
+# Family fallback for model names absent from PRICING (date-stamped aliases, or older
+# / newer generations than the exact list). Checked in order; the first key that is a
+# substring of the lowercased model name wins, so generation-specific keys precede the
+# bare family name. This keeps cost estimates non-zero for any recognizable Claude model
+# while staying generation-aware where a family spans price tiers (Opus 3 vs 4, Haiku 3
+# vs 3.5 vs 4.x). Sonnet is uniform at $3/$15 across generations.
+_TIER_FALLBACKS: tuple[tuple[str, ModelPrice], ...] = (
+    ("claude-3-opus", ModelPrice(15.0, 75.0)),
+    ("opus", ModelPrice(5.0, 25.0)),
+    ("claude-3-5-haiku", ModelPrice(0.80, 4.0)),
+    ("claude-3-haiku", ModelPrice(0.25, 1.25)),
+    ("haiku", ModelPrice(1.0, 5.0)),
+    ("sonnet", ModelPrice(3.0, 15.0)),
+    ("fable", ModelPrice(10.0, 50.0)),
+)
+
+
+def _price_for(model: str | None) -> ModelPrice | None:
+    """Resolve a model's price: an exact PRICING entry first, then a family fallback.
+
+    Returns None for an empty name or one with no Claude family word (truly unknown /
+    ``<synthetic>``), which callers treat as $0.
+    """
+    if not model:
+        return None
+    exact = PRICING.get(model)
+    if exact is not None:
+        return exact
+    low = model.lower()
+    for key, price in _TIER_FALLBACKS:
+        if key in low:
+            return price
+    return None
+
 
 def cost_for(
     model: str | None,
@@ -50,9 +84,10 @@ def cost_for(
 ) -> float:
     """Return the estimated USD cost of one usage record.
 
-    Unknown/synthetic models price to 0.0 - they have no real API spend.
+    A model not in PRICING falls back to its family rate; names with no Claude family
+    word (synthetic / non-Claude) price to 0.0 - they have no real API spend.
     """
-    price = PRICING.get(model or "")
+    price = _price_for(model)
     if price is None:
         return 0.0
     return (
@@ -66,3 +101,18 @@ def cost_for(
 def pricing_rows() -> list[tuple[str, float, float]]:
     """Pricing as ``(model, input_per_mtok, output_per_mtok)`` rows for SQL registration."""
     return [(m, p.input_per_mtok, p.output_per_mtok) for m, p in PRICING.items()]
+
+
+def tier_case_sql(model_sql: str, attr: str) -> str:
+    """A DuckDB ``CASE`` mapping an unrecognized model name to its family-fallback price.
+
+    *attr* is ``"input_per_mtok"`` or ``"output_per_mtok"``. Generated from the same
+    ``_TIER_FALLBACKS`` table as :func:`_price_for`, so the SQL cost view and
+    :func:`cost_for` cannot drift. Yields NULL when no family matches (caller COALESCEs
+    that to the exact-match price or 0). The keys are static literals, so no escaping.
+    """
+    whens = " ".join(
+        f"WHEN contains(lower({model_sql}), '{key}') THEN {getattr(price, attr)}"
+        for key, price in _TIER_FALLBACKS
+    )
+    return f"CASE {whens} END"
