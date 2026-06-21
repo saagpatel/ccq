@@ -1,0 +1,29 @@
+name: Release
+
+# Publish to PyPI on a version tag (e.g. v0.1.0) via trusted publishing.
+# No API token: PyPI mints a short-lived OIDC credential for this workflow.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  pypi-publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Publish to PyPI (trusted publishing, no token)
+        run: uv publish
