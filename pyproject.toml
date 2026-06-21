@@ -1,6 +1,6 @@
 [project]
 name = "ccq"
-version = "0.1.1"
+version = "0.2.0"
 description = "Query your own Claude Code agent history with DuckDB, read-only, straight over the JSONL transcripts."
 readme = "README.md"
 authors = [{ name = "saagpatel" }]
