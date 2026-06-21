@@ -1,0 +1,63 @@
+[project]
+name = "ccq"
+version = "0.1.0"
+description = "Query your own Claude Code agent history with DuckDB, read-only, straight over the JSONL transcripts."
+readme = "README.md"
+authors = [{ name = "saagpatel" }]
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["claude-code", "duckdb", "cli", "jsonl", "observability", "agent-history"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+dependencies = ["duckdb>=1.1.0", "click>=8.1.0"]
+
+[project.urls]
+Homepage = "https://github.com/saagpatel/ccq"
+Repository = "https://github.com/saagpatel/ccq"
+Issues = "https://github.com/saagpatel/ccq/issues"
+
+[project.scripts]
+ccq = "ccq.cli:main"
+
+[dependency-groups]
+dev = [{ include-group = "lint" }, { include-group = "test" }]
+lint = ["ruff", "ty"]
+test = ["pytest", "pytest-cov"]
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D",       # docstring rules - not enforcing full pydocstyle
+    "COM812",  # trailing-comma conflict with formatter
+    "ISC001",  # implicit-str-concat conflict with formatter
+    "S608",    # SQL "injection" - SQL is internal; user SQL runs in a sealed read-only conn
+    "PLR0913", # too many arguments - CLI commands legitimately take several
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "PLR2004", "INP001", "ERA001", "SLF001", "DTZ"] # asserts, magic vals, no __init__, comments, test internals, naive fixture datetimes
+"src/ccq/cli.py" = ["FBT001"]                                 # Click maps --flags to bool params
+"src/ccq/db.py" = ["E501"]                                    # embedded SQL reads better unwrapped
+"src/ccq/server.py" = ["E501"]                                # embedded HTML/CSS reads better unwrapped
+
+[tool.pytest.ini_options]
+addopts = ["--cov=ccq", "--cov-report=term-missing"]
+testpaths = ["tests"]
+
+[tool.ty.environment]
+python-version = "3.12"
