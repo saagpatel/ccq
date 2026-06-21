@@ -324,9 +324,12 @@ def build_cache(
     """
     cache_path = cache_path or default_cache_path()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    if cache_path.exists():
-        cache_path.unlink()
-    con = duckdb.connect(str(cache_path))
+    # Build into a sibling temp file and swap it in atomically, so a crash mid-build
+    # leaves the previous good snapshot in place rather than a half-written one that
+    # connect_fast would later open and choke on.
+    tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+    tmp_path.unlink(missing_ok=True)
+    con = duckdb.connect(str(tmp_path))
     try:
         _install_relations(con, projects_dir)
         for name in _MATERIALIZED:
@@ -342,6 +345,7 @@ def build_cache(
             con.execute(f"ALTER TABLE _m_{name} RENAME TO {name}")
     finally:
         con.close()
+    tmp_path.replace(cache_path)  # atomic on POSIX: readers see old or new, never partial
     return cache_path
 
 
@@ -364,11 +368,16 @@ def connect_fast(cache_path: Path | None = None) -> duckdb.DuckDBPyConnection:
 def is_cache_stale(
     cache_path: Path | None = None, projects_dir: Path | str = DEFAULT_PROJECTS_DIR
 ) -> bool:
-    """True if any transcript is newer than the snapshot (or the snapshot is missing)."""
+    """True if any transcript is newer than the snapshot (or the snapshot is missing).
+
+    The snapshot mtime is read with a single ``stat`` (no exists-then-stat race): a
+    snapshot deleted concurrently is treated as stale rather than crashing the CLI.
+    """
     path = Path(cache_path or default_cache_path())
-    if not path.exists():
+    try:
+        built = path.stat().st_mtime
+    except FileNotFoundError:
         return True
-    built = path.stat().st_mtime
     return any(p.stat().st_mtime > built for p in Path(projects_dir).glob("*/*.jsonl"))
 
 
@@ -461,13 +470,19 @@ def assert_read_only(sql: str) -> None:
 
 
 def run_read_only(
-    con: duckdb.DuckDBPyConnection, sql: str
+    con: duckdb.DuckDBPyConnection, sql: str, limit: int | None = None
 ) -> tuple[list[str], list[tuple[object, ...]]]:
-    """Run a validated read-only query, returning (column_names, rows)."""
+    """Run a validated read-only query, returning (column_names, rows).
+
+    When *limit* is set, at most ``limit + 1`` rows are fetched (the extra row lets
+    the caller detect truncation) instead of the whole result. The web viewer uses
+    this to bound memory on an unrestricted ``SELECT`` typed into its SQL box.
+    """
     assert_read_only(sql)
     cur = con.execute(sql)
     columns = [d[0] for d in cur.description] if cur.description else []
-    return columns, cur.fetchall()
+    rows = cur.fetchall() if limit is None else cur.fetchmany(limit + 1)
+    return columns, rows
 
 
 def query(

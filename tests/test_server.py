@@ -8,6 +8,7 @@ from ccq import server
 
 if TYPE_CHECKING:
     import duckdb
+    import pytest
 
 
 def test_dashboard_renders_sections(con: duckdb.DuckDBPyConnection) -> None:
@@ -21,6 +22,17 @@ def test_dashboard_runs_read_only_query(con: duckdb.DuckDBPyConnection) -> None:
     body = server._dashboard(con, "SELECT project FROM sessions ORDER BY 1")
     assert "Result (2 rows)" in body
     assert "web-api" in body
+
+
+def test_dashboard_caps_large_result(
+    con: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With the cap forced to 1, the multi-row events query renders the truncation
+    # heading rather than the full result, bounding memory + DOM size.
+    monkeypatch.setattr(server, "_MAX_RENDER_ROWS", 1)
+    body = server._dashboard(con, "SELECT * FROM events")
+    assert "first 1 rows" in body
+    assert "add a LIMIT" in body
 
 
 def test_dashboard_refuses_write(con: duckdb.DuckDBPyConnection) -> None:

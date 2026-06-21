@@ -71,3 +71,19 @@ def test_is_cache_stale(transcripts_dir: Path, tmp_path: Path) -> None:
 
 def test_is_cache_stale_missing_is_stale(tmp_path: Path) -> None:
     assert db.is_cache_stale(tmp_path / "nope.duckdb", tmp_path) is True
+
+
+def test_build_cache_leaves_no_tmp_and_overwrites(transcripts_dir: Path, tmp_path: Path) -> None:
+    cache = tmp_path / "ccq.duckdb"
+    db.build_cache(transcripts_dir, cache)
+    assert cache.exists()
+    # The atomic .tmp scratch file is swapped in, not left behind.
+    assert not (tmp_path / "ccq.duckdb.tmp").exists()
+    # Rebuilding over an existing snapshot succeeds (atomic replace, no unlink race).
+    db.build_cache(transcripts_dir, cache)
+    assert cache.exists()
+    con = db.connect_fast(cache)
+    try:
+        assert con.execute("SELECT count(*) FROM sessions").fetchone()[0] == 2
+    finally:
+        con.close()

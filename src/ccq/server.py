@@ -159,6 +159,10 @@ _SECTIONS: tuple[tuple[str, str], ...] = (
 
 _SESSION_LINK = "/session?id={}"
 
+# Cap rows fetched + rendered for an ad-hoc SQL-box query, so an unbounded
+# `SELECT * FROM events` cannot exhaust memory or freeze the browser tab.
+_MAX_RENDER_ROWS = 1000
+
 
 def _project_chips(con: duckdb.DuckDBPyConnection) -> str:
     """A row of project links (top projects by cost) for drill-down filtering."""
@@ -199,8 +203,14 @@ def _dashboard(
     parts = [_header(), _sql_box(query)]
     if query:
         try:
-            cols, rows = db.run_read_only(con, query)
-            parts.append(f"<h2>Result ({len(rows)} rows)</h2>{_table(cols, rows)}")
+            cols, rows = db.run_read_only(con, query, limit=_MAX_RENDER_ROWS)
+            if len(rows) > _MAX_RENDER_ROWS:
+                shown = rows[:_MAX_RENDER_ROWS]
+                heading = f"Result (first {_MAX_RENDER_ROWS:,} rows; add a LIMIT to narrow)"
+            else:
+                shown = rows
+                heading = f"Result ({len(rows):,} rows)"
+            parts.append(f"<h2>{html.escape(heading)}</h2>{_table(cols, shown)}")
         except db.UnsafeSQLError as exc:
             parts.append(f"<p class='err'>Refused: {html.escape(str(exc))}</p>")
         except Exception as exc:  # noqa: BLE001 - surface any DuckDB error to the page
@@ -274,7 +284,7 @@ def _session_view(con: duckdb.DuckDBPyConnection, prefix: str) -> str:
     proj_link = f"/?project={quote(str(proj))}" if proj else "/"
     meta = (
         f"<p class='sub'>project <a href='{html.escape(proj_link)}'>{html.escape(str(proj))}</a> "
-        f"&middot; branch {html.escape(str(branch))} &middot; {html.escape(str(msgs))} messages "
+        f"&middot; branch {html.escape(branch or '(no branch)')} &middot; {html.escape(str(msgs))} messages "
         f"&middot; {html.escape(str(dur))} min &middot; est ${html.escape(str(cost))}</p>"
     )
     timeline = _run(con, _TIMELINE_SQL, [sid, sid, sid])  # timeline rows are not linked
