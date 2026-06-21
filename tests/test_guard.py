@@ -119,3 +119,10 @@ def test_run_read_only_returns_rows(con: duckdb.DuckDBPyConnection) -> None:
 def test_run_read_only_blocks_write(con: duckdb.DuckDBPyConnection) -> None:
     with pytest.raises(UnsafeSQLError):
         run_read_only(con, "DROP VIEW sessions")
+
+
+def test_run_read_only_limit_caps_fetch(con: duckdb.DuckDBPyConnection) -> None:
+    # The events view has more than 2 rows; limit=1 fetches at most limit + 1 so the
+    # caller can detect truncation without materializing the whole result.
+    _, rows = run_read_only(con, "SELECT * FROM events", limit=1)
+    assert len(rows) == 2

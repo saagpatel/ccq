@@ -1,10 +1,10 @@
-# ccq — query your own Claude Code agent history
+# ccq: query your own Claude Code agent history
 
 [![CI](https://img.shields.io/github/actions/workflow/status/saagpatel/ccq/ci.yml?style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/saagpatel/ccq/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 
 `ccq` makes your local Claude Code transcripts queryable. It runs **DuckDB directly
-over the JSONL** at `~/.claude/projects/<project>/<session>.jsonl` — no copy, no ETL,
+over the JSONL** at `~/.claude/projects/<project>/<session>.jsonl`. No copy, no ETL,
 no database to maintain. The transcripts are only ever **read**, never written.
 
 Ask it where your tokens go, which tools you lean on, where runs hit rate limits,
@@ -73,16 +73,16 @@ Standard-library `http.server`, no extra dependencies, binds to localhost only.
 
 ## The query surface (`ccq sql`)
 
-`sql` exposes these views — compose your own:
+`sql` exposes these views. Compose your own:
 
-- **`sessions`** — one row per session: project, branch, span, `messages`, `models`, tokens, `cost_usd`.
-- **`message_usage`** — one row per assistant turn: token breakdown + `cost_usd`.
-- **`tool_calls`** — one row per tool invocation: `tool_name`, `tool_input` (JSON).
-- **`errors`** — API error events: `status`, project, session, model.
-- **`agents`** / **`agent_results`** — subagent dispatches joined to their `subagent_tokens`.
-- **`prompts`** — searchable typed prompts + session titles.
-- **`events`** — the raw per-line view everything else is built on.
-- **`model_pricing`** — the per-model rate table used for costing.
+- **`sessions`** - one row per session: project, branch, span, `messages`, `models`, tokens, `cost_usd`.
+- **`message_usage`** - one row per assistant turn: token breakdown + `cost_usd`.
+- **`tool_calls`** - one row per tool invocation: `tool_name`, `tool_input` (JSON).
+- **`errors`** - API error events: `status`, project, session, model.
+- **`agents`** / **`agent_results`** - subagent dispatches joined to their `subagent_tokens`.
+- **`prompts`** - searchable typed prompts + session titles.
+- **`events`** - the raw per-line view everything else is built on.
+- **`model_pricing`** - the per-model rate table used for costing.
 
 ```bash
 ccq sql "SELECT project, round(sum(cost_usd),2) usd
@@ -92,12 +92,12 @@ ccq sql "SELECT project, round(sum(cost_usd),2) usd
 
 `sql` accepts a **single read-only statement** (SELECT/WITH/EXPLAIN/…). Writes,
 `ATTACH`, `COPY`, `INSTALL`, and multi-statement input are refused. Tip: DuckDB
-reserves words like `day`, `first`, `last` — quote them if used as aliases (`AS "day"`).
+reserves words like `day`, `first`, `last`, so quote them if used as aliases (`AS "day"`).
 
 ## How it works
 
 `read_ndjson_objects('~/.claude/projects/*/*.jsonl')` loads each line as an opaque
-`JSON` value (zero schema inference — the records are heterogeneous), and SQL views
+`JSON` value (zero schema inference, since the records are heterogeneous), and SQL views
 extract the entities. Two things the transcripts taught us are baked in:
 
 - Numeric fields use `TRY_CAST` (heterogeneous lines otherwise break a hard cast).
@@ -110,8 +110,8 @@ Transcripts store **token counts, not dollars**. `ccq` prices them with publishe
 per-million-token rates (`src/ccq/pricing.py`) and the standard cache multipliers
 (cache write 1.25×, cache read 0.10×). Two honest caveats:
 
-1. **Estimates, not invoices** — unknown/`<synthetic>` models price to `$0`.
-2. **Main-loop only** — a subagent's spend is **not** in the transcript. The only
+1. **Estimates, not invoices**: unknown/`<synthetic>` models price to `$0`.
+2. **Main-loop only**: a subagent's spend is **not** in the transcript. The only
    signal that survives is `toolUseResult.totalTokens` (no input/output split, so it
    can't be priced). `ccq agents` surfaces those token totals **separately**; they
    are never folded into a dollar figure.
@@ -124,5 +124,5 @@ uv run ruff check . && uv run ruff format .     # lint + format
 uv run ty check src/                            # type check
 ```
 
-Read-only on `~/.claude/projects` by contract — the test suite uses synthetic
+Read-only on `~/.claude/projects` by contract. The test suite uses synthetic
 fixtures and never reads your real history.
