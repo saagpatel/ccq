@@ -130,6 +130,9 @@ extract the entities. Two things the transcripts taught us are baked in:
 - Numeric fields use `TRY_CAST` (heterogeneous lines otherwise break a hard cast).
 - Token-casting views read from a type-filtered subquery so the optimizer can't
   reorder a cast ahead of the `type = 'assistant'` filter.
+- Malformed lines and non-object JSON do not fail the scan; identity fields stay
+  JSON strings (objects/arrays are not coerced into ids or project names), and
+  unreadable files yield the same empty views as a missing projects dir.
 
 ## Cost is estimated, and main-loop only
 
