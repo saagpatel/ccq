@@ -384,6 +384,195 @@ def test_is_cache_stale_unlistable_dir_is_stale(
     assert is_cache_stale(cache, tmp_path) is True
 
 
+class _GlobRaisesDuringIter:
+    """A glob result that fails on ``next``, not at the ``glob()`` call."""
+
+    def __iter__(self) -> _GlobRaisesDuringIter:
+        return self
+
+    def __next__(self) -> Path:
+        raise OSError
+
+
+class _GlobRaisesAfterFirst:
+    """Yields one path, then raises — the listing-time failure glob actually hits."""
+
+    def __init__(self, first: Path) -> None:
+        self._first = first
+        self._sent = False
+
+    def __iter__(self) -> _GlobRaisesAfterFirst:
+        return self
+
+    def __next__(self) -> Path:
+        if not self._sent:
+            self._sent = True
+            return self._first
+        raise OSError
+
+
+def test_glob_raises_during_iteration_uses_empty_views(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_jsonl(tmp_path, "ok.jsonl", [_VALID_USER])
+
+    def boom(self: Path, pattern: str) -> _GlobRaisesDuringIter:  # noqa: ARG001
+        return _GlobRaisesDuringIter()
+
+    monkeypatch.setattr("ccq.db.Path.glob", boom)
+    con = connect(tmp_path)
+    try:
+        _query_all_views(con)
+        assert con.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_glob_raises_after_first_yield_uses_empty_views(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_jsonl(tmp_path, "ok.jsonl", [_VALID_USER])
+
+    def boom(self: Path, pattern: str) -> _GlobRaisesAfterFirst:  # noqa: ARG001
+        return _GlobRaisesAfterFirst(path)
+
+    monkeypatch.setattr("ccq.db.Path.glob", boom)
+    con = connect(tmp_path)
+    try:
+        _query_all_views(con)
+        assert con.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+        assert con.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_is_cache_stale_glob_raises_during_iteration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "ccq.duckdb"
+    cache.write_bytes(b"not-a-real-snapshot")
+    os.utime(cache, (2_000_000_000, 2_000_000_000))
+    first = _write_jsonl(tmp_path, "ok.jsonl", [_VALID_USER])
+    os.utime(first, (1_000_000, 1_000_000))
+
+    def boom(self: Path, pattern: str) -> _GlobRaisesAfterFirst:  # noqa: ARG001
+        return _GlobRaisesAfterFirst(first)
+
+    monkeypatch.setattr("ccq.db.Path.glob", boom)
+    assert is_cache_stale(cache, tmp_path) is True
+
+
+_WRONG_ERROR_SHAPES = (
+    None,
+    [429],
+    {"code": 429},
+    True,
+    429,
+)
+
+
+@pytest.mark.parametrize("status", _WRONG_ERROR_SHAPES)
+def test_wrong_shaped_api_error_status_is_unavailable(tmp_path: Path, status: object) -> None:
+    path = _write_jsonl(
+        tmp_path,
+        "err.jsonl",
+        [
+            {
+                "type": "assistant",
+                "sessionId": "s-status",
+                "cwd": "/home/user/Projects/demo-app",
+                "apiErrorStatus": status,
+            }
+        ],
+    )
+    con = connect(tmp_path)
+    try:
+        _query_all_views(con)
+        row = con.execute("SELECT api_error_status, is_api_error, filename FROM events").fetchone()
+        assert row is not None
+        assert row[0] is None
+        assert row[1] is None or row[1] is False
+        assert row[2] == str(path)
+        assert '{"code":429}' not in str(row)
+        assert "[429]" not in str(row)
+        assert con.execute("SELECT count(*) FROM errors").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+_WRONG_FLAG_SHAPES = (
+    None,
+    [True],
+    {"ok": True},
+    "true",
+    1,
+)
+
+
+@pytest.mark.parametrize("flag", _WRONG_FLAG_SHAPES)
+def test_wrong_shaped_api_error_flag_is_unavailable(tmp_path: Path, flag: object) -> None:
+    path = _write_jsonl(
+        tmp_path,
+        "flag.jsonl",
+        [
+            {
+                "type": "assistant",
+                "sessionId": "s-flag",
+                "cwd": "/home/user/Projects/demo-app",
+                "isApiErrorMessage": flag,
+            }
+        ],
+    )
+    con = connect(tmp_path)
+    try:
+        _query_all_views(con)
+        row = con.execute("SELECT is_api_error, api_error_status, filename FROM events").fetchone()
+        assert row is not None
+        assert row[0] is not True
+        assert row[1] is None
+        assert row[2] == str(path)
+        assert con.execute("SELECT count(*) FROM errors").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_valid_api_error_shapes_and_provenance_are_preserved(tmp_path: Path) -> None:
+    path = _write_jsonl(
+        tmp_path,
+        "ok-err.jsonl",
+        [
+            {
+                "type": "assistant",
+                "sessionId": "s-ok",
+                "cwd": "/home/user/Projects/demo-app",
+                "isApiErrorMessage": True,
+                "apiErrorStatus": "429",
+                "message": {"role": "assistant", "model": "claude-opus-4-8"},
+            },
+            {
+                "type": "assistant",
+                "sessionId": "s-wrong",
+                "cwd": "/home/user/Projects/demo-app",
+                "isApiErrorMessage": {"flag": True},
+                "apiErrorStatus": 429,
+            },
+        ],
+    )
+    con = connect(tmp_path)
+    try:
+        _query_all_views(con)
+        errors = con.execute("SELECT session_id, status FROM errors ORDER BY session_id").fetchall()
+        assert errors == [("s-ok", "429")]
+        files = {r[0] for r in con.execute("SELECT filename FROM events").fetchall()}
+        assert files == {str(path)}
+        flag_wrong = con.execute(
+            "SELECT is_api_error, api_error_status FROM events WHERE session_id = 's-wrong'"
+        ).fetchone()
+        assert flag_wrong == (None, None)
+    finally:
+        con.close()
+
+
 def test_cli_empty_and_unknown_session_states(tmp_path: Path) -> None:
     empty = tmp_path / "projects"
     empty.mkdir()

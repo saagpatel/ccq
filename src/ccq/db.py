@@ -16,7 +16,9 @@ Wrong-shape JSONL is tolerated without failing the connection:
   are the same empty relation used for a fresh/empty projects dir.
 - ``ignore_errors`` keeps the scan going on malformed lines; entity views only
   project JSON objects, and identity fields require a JSON string (objects and
-  arrays are not stringified into session ids, paths, or tool names).
+  arrays are not stringified into session ids, paths, or tool names). API error
+  flags require a JSON boolean and statuses a JSON string; other shapes are
+  unavailable rather than coerced into text.
 """
 
 from __future__ import annotations
@@ -67,6 +69,18 @@ def _json_str(src: str, path: str) -> str:
     )
 
 
+def _json_bool_true(src: str, path: str) -> str:
+    """SQL: true iff *path* is JSON boolean true; else NULL.
+
+    Wrong types (string/number/object/array) are unavailable, not stringified
+    into a match. JSON boolean false is an explicit non-match.
+    """
+    return (
+        f"CASE WHEN json_type({src}, '{path}') = 'BOOLEAN' "
+        f"THEN json_extract_string({src}, '{path}') = 'true' END"
+    )
+
+
 _CWD = _json_str("json", "$.cwd")
 
 # Empty ``raw`` used when the glob matches nothing, or every match is unreadable.
@@ -107,6 +121,18 @@ class UnsafeSQLError(ValueError):
     """Raised when a user-supplied SQL statement is not a single read-only query."""
 
 
+def _jsonl_matches(projects_dir: Path | str) -> list[Path] | None:
+    """``*/*.jsonl`` paths, or None if the directory listing is unavailable.
+
+    ``Path.glob`` typically fails while iterating, not at the call, so the
+    iterator is consumed inside the ``OSError`` boundary.
+    """
+    try:
+        return list(Path(projects_dir).glob("*/*.jsonl"))
+    except OSError:
+        return None
+
+
 def _readable_transcripts(projects_dir: Path | str) -> list[Path]:
     """Existing, readable ``*/*.jsonl`` files under *projects_dir*.
 
@@ -114,9 +140,8 @@ def _readable_transcripts(projects_dir: Path | str) -> list[Path]:
     rather than failing ``connect``. The returned paths are the scan inputs, so
     ``filename=true`` keeps source provenance on each row.
     """
-    try:
-        found = Path(projects_dir).glob("*/*.jsonl")
-    except OSError:
+    found = _jsonl_matches(projects_dir)
+    if found is None:
         return []
     files: list[Path] = []
     for path in found:
@@ -173,8 +198,8 @@ SELECT
     {_json_str("json", "$.version")}          AS version,
     {_json_str("json", "$.message.role")}     AS role,
     {_json_str("json", "$.message.model")}    AS model,
-    json_extract_string(json, '$.apiErrorStatus')   AS api_error_status,
-    json_extract_string(json, '$.isApiErrorMessage') = 'true' AS is_api_error,
+    {_json_str("json", "$.apiErrorStatus")}     AS api_error_status,
+    {_json_bool_true("json", "$.isApiErrorMessage")} AS is_api_error,
     json
 FROM raw
 WHERE json_type(json) = 'OBJECT';
@@ -437,9 +462,8 @@ def is_cache_stale(
         built = path.stat().st_mtime
     except FileNotFoundError:
         return True
-    try:
-        found = Path(projects_dir).glob("*/*.jsonl")
-    except OSError:
+    found = _jsonl_matches(projects_dir)
+    if found is None:
         return True
     for src in found:
         try:
