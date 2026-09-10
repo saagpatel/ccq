@@ -10,6 +10,13 @@ Two real-data lessons are encoded here:
 - A token cast over the unfiltered scan gets reordered ahead of the type filter by
   the optimizer and blows up, so every view that casts tokens reads from a
   type-filtered subquery barrier.
+
+Wrong-shape JSONL is tolerated without failing the connection:
+- Unreadable or vanished ``*/*.jsonl`` files are skipped; if none remain, views
+  are the same empty relation used for a fresh/empty projects dir.
+- ``ignore_errors`` keeps the scan going on malformed lines; entity views only
+  project JSON objects, and identity fields require a JSON string (objects and
+  arrays are not stringified into session ids, paths, or tool names).
 """
 
 from __future__ import annotations
@@ -48,7 +55,25 @@ def _project_expr(cwd_sql: str) -> str:
     )
 
 
-_CWD = "json_extract_string(json, '$.cwd')"
+def _json_str(src: str, path: str) -> str:
+    """SQL that yields a JSON string at *path*, else NULL.
+
+    ``json_extract_string`` stringifies objects and arrays, which would invent
+    session ids and project names. Identity fields must be JSON strings.
+    """
+    return (
+        f"CASE WHEN json_type({src}, '{path}') = 'VARCHAR' "
+        f"THEN json_extract_string({src}, '{path}') END"
+    )
+
+
+_CWD = _json_str("json", "$.cwd")
+
+# Empty ``raw`` used when the glob matches nothing, or every match is unreadable.
+_EMPTY_RAW_SQL = (
+    "CREATE VIEW raw AS SELECT * FROM "
+    "(SELECT NULL::VARCHAR AS filename, NULL::JSON AS json) WHERE false"
+)
 
 # Statements we refuse to run via the `sql` escape hatch. This is a personal tool
 # over the operator's own data, so the goal is "don't accidentally write to or
@@ -82,8 +107,42 @@ class UnsafeSQLError(ValueError):
     """Raised when a user-supplied SQL statement is not a single read-only query."""
 
 
-def _glob(projects_dir: Path) -> str:
-    return str(Path(projects_dir) / "*" / "*.jsonl")
+def _readable_transcripts(projects_dir: Path | str) -> list[Path]:
+    """Existing, readable ``*/*.jsonl`` files under *projects_dir*.
+
+    Dangling symlinks, unreadable files, and unlistable directories are skipped
+    rather than failing ``connect``. The returned paths are the scan inputs, so
+    ``filename=true`` keeps source provenance on each row.
+    """
+    try:
+        found = Path(projects_dir).glob("*/*.jsonl")
+    except OSError:
+        return []
+    files: list[Path] = []
+    for path in found:
+        try:
+            if path.is_file() and os.access(path, os.R_OK):
+                files.append(path)
+        except OSError:
+            continue
+    return files
+
+
+def _create_raw_view(con: duckdb.DuckDBPyConnection, projects_dir: Path | str) -> None:
+    """Attach ``raw`` as a scan of readable transcripts, or the empty relation."""
+    files = _readable_transcripts(projects_dir)
+    if not files:
+        con.execute(_EMPTY_RAW_SQL)
+        return
+    literals = ", ".join("'" + str(path).replace("'", "''") + "'" for path in files)
+    try:
+        con.execute(
+            "CREATE VIEW raw AS SELECT filename, json FROM "
+            f"read_ndjson_objects([{literals}], filename=true, ignore_errors=true)"
+        )
+    except duckdb.IOException:
+        # Vanished between the listing and the scan: same empty state as no files.
+        con.execute(_EMPTY_RAW_SQL)
 
 
 def _views_sql() -> str:
@@ -98,26 +157,27 @@ def _views_sql() -> str:
         f" + u.output_tokens * {out_price}) / 1e6"
     )
     return rf"""
--- Every line, common scalar fields. No numeric casts here (keep the base scan safe).
+-- JSON objects only. No numeric casts here (keep the base scan safe).
 CREATE VIEW events AS
 SELECT
     filename,
-    json_extract_string(json, '$.sessionId')        AS session_id,
-    json_extract_string(json, '$.type')             AS type,
-    json_extract_string(json, '$.uuid')             AS uuid,
-    json_extract_string(json, '$.parentUuid')       AS parent_uuid,
-    TRY_CAST(json_extract_string(json, '$.timestamp') AS TIMESTAMP) AS ts,
-    json_extract_string(json, '$.cwd')              AS cwd,
+    {_json_str("json", "$.sessionId")}        AS session_id,
+    {_json_str("json", "$.type")}             AS type,
+    {_json_str("json", "$.uuid")}             AS uuid,
+    {_json_str("json", "$.parentUuid")}       AS parent_uuid,
+    TRY_CAST({_json_str("json", "$.timestamp")} AS TIMESTAMP) AS ts,
+    {_CWD}                                      AS cwd,
     {_project_expr(_CWD)}                         AS project,
-    json_extract_string(json, '$.gitBranch')        AS git_branch,
-    json_extract_string(json, '$.requestId')        AS request_id,
-    json_extract_string(json, '$.version')          AS version,
-    json_extract_string(json, '$.message.role')     AS role,
-    json_extract_string(json, '$.message.model')    AS model,
+    {_json_str("json", "$.gitBranch")}        AS git_branch,
+    {_json_str("json", "$.requestId")}        AS request_id,
+    {_json_str("json", "$.version")}          AS version,
+    {_json_str("json", "$.message.role")}     AS role,
+    {_json_str("json", "$.message.model")}    AS model,
     json_extract_string(json, '$.apiErrorStatus')   AS api_error_status,
     json_extract_string(json, '$.isApiErrorMessage') = 'true' AS is_api_error,
     json
-FROM raw;
+FROM raw
+WHERE json_type(json) = 'OBJECT';
 
 -- Per assistant turn: token usage + estimated USD (main-loop only).
 CREATE VIEW message_usage AS
@@ -127,20 +187,23 @@ SELECT
     {cost_expr} AS cost_usd
 FROM (
     SELECT
-        json_extract_string(json, '$.sessionId') AS session_id,
+        {_json_str("json", "$.sessionId")} AS session_id,
         {_project_expr(_CWD)} AS project,
-        json_extract_string(json, '$.cwd') AS cwd,
-        json_extract_string(json, '$.gitBranch') AS git_branch,
-        TRY_CAST(json_extract_string(json, '$.timestamp') AS TIMESTAMP) AS ts,
-        json_extract_string(json, '$.message.model') AS model,
-        json_extract_string(json, '$.requestId') AS request_id,
+        {_CWD} AS cwd,
+        {_json_str("json", "$.gitBranch")} AS git_branch,
+        TRY_CAST({_json_str("json", "$.timestamp")} AS TIMESTAMP) AS ts,
+        {_json_str("json", "$.message.model")} AS model,
+        {_json_str("json", "$.requestId")} AS request_id,
         COALESCE(TRY_CAST(json_extract_string(json, '$.message.usage.input_tokens') AS BIGINT), 0) AS input_tokens,
         COALESCE(TRY_CAST(json_extract_string(json, '$.message.usage.output_tokens') AS BIGINT), 0) AS output_tokens,
         COALESCE(TRY_CAST(json_extract_string(json, '$.message.usage.cache_creation_input_tokens') AS BIGINT), 0) AS cache_creation_tokens,
         COALESCE(TRY_CAST(json_extract_string(json, '$.message.usage.cache_read_input_tokens') AS BIGINT), 0) AS cache_read_tokens
     FROM raw
-    WHERE json_extract_string(json, '$.type') = 'assistant'
-      AND json_extract_string(json, '$.message.model') IS NOT NULL
+    WHERE json_type(json) = 'OBJECT'
+      AND {_json_str("json", "$.type")} = 'assistant'
+      AND {_json_str("json", "$.message.model")} IS NOT NULL
+      AND (json_type(json, '$.message.usage') IS NULL
+           OR json_type(json, '$.message.usage') = 'OBJECT')
 ) u
 LEFT JOIN model_pricing p ON p.model = u.model;
 
@@ -148,25 +211,26 @@ LEFT JOIN model_pricing p ON p.model = u.model;
 CREATE VIEW tool_calls AS
 SELECT
     a.session_id, a.project, a.cwd, a.ts,
-    tc->>'$.name'  AS tool_name,
-    tc->>'$.id'    AS tool_use_id,
+    {_json_str("tc", "$.name")}  AS tool_name,
+    {_json_str("tc", "$.id")}    AS tool_use_id,
     tc->'$.input'  AS tool_input
 FROM (
     SELECT
-        json_extract_string(json, '$.sessionId') AS session_id,
+        {_json_str("json", "$.sessionId")} AS session_id,
         {_project_expr(_CWD)} AS project,
-        json_extract_string(json, '$.cwd') AS cwd,
-        TRY_CAST(json_extract_string(json, '$.timestamp') AS TIMESTAMP) AS ts,
+        {_CWD} AS cwd,
+        TRY_CAST({_json_str("json", "$.timestamp")} AS TIMESTAMP) AS ts,
         json->'$.message.content' AS content
     FROM raw
-    WHERE json_extract_string(json, '$.type') = 'assistant'
+    WHERE json_type(json) = 'OBJECT'
+      AND {_json_str("json", "$.type")} = 'assistant'
 ) a,
 UNNEST(
     CASE WHEN json_type(a.content) = 'ARRAY'
          THEN TRY_CAST(a.content AS JSON[])
          ELSE CAST([] AS JSON[]) END
 ) AS t(tc)
-WHERE tc->>'$.type' = 'tool_use';
+WHERE {_json_str("tc", "$.type")} = 'tool_use';
 
 -- API errors / retries (rate limits, transient failures).
 CREATE VIEW errors AS
@@ -179,11 +243,12 @@ WHERE is_api_error OR api_error_status IS NOT NULL;
 CREATE VIEW agent_results AS
 SELECT
     session_id,
-    r->>'$.tool_use_id' AS tool_use_id,
+    {_json_str("r", "$.tool_use_id")} AS tool_use_id,
     TRY_CAST(json_extract_string(json, '$.toolUseResult.totalTokens') AS BIGINT) AS total_tokens
 FROM (
-    SELECT json, json_extract_string(json, '$.sessionId') AS session_id FROM raw
-    WHERE json_extract_string(json, '$.type') = 'user'
+    SELECT json, {_json_str("json", "$.sessionId")} AS session_id FROM raw
+    WHERE json_type(json) = 'OBJECT'
+      AND {_json_str("json", "$.type")} = 'user'
       AND json_extract_string(json, '$.toolUseResult.totalTokens') IS NOT NULL
 ) ,
 UNNEST(
@@ -191,14 +256,14 @@ UNNEST(
          THEN TRY_CAST(json->'$.message.content' AS JSON[])
          ELSE CAST([] AS JSON[]) END
 ) AS t(r)
-WHERE r->>'$.type' = 'tool_result';
+WHERE {_json_str("r", "$.type")} = 'tool_result';
 
 CREATE VIEW agents AS
 SELECT
     tc.session_id, tc.project, tc.ts,
-    tc.tool_input->>'$.subagent_type' AS subagent_type,
-    tc.tool_input->>'$.model'         AS model,
-    tc.tool_input->>'$.description'    AS description,
+    {_json_str("tc.tool_input", "$.subagent_type")} AS subagent_type,
+    {_json_str("tc.tool_input", "$.model")}         AS model,
+    {_json_str("tc.tool_input", "$.description")}    AS description,
     ar.total_tokens                   AS subagent_tokens
 FROM tool_calls tc
 LEFT JOIN agent_results ar
@@ -241,21 +306,23 @@ FROM msg m LEFT JOIN cost c ON c.session_id = m.session_id;
 CREATE VIEW prompts AS
 SELECT * FROM (
     SELECT
-        json_extract_string(json, '$.sessionId') AS session_id,
+        {_json_str("json", "$.sessionId")} AS session_id,
         {_project_expr(_CWD)} AS project,
-        TRY_CAST(json_extract_string(json, '$.timestamp') AS TIMESTAMP) AS ts,
+        TRY_CAST({_json_str("json", "$.timestamp")} AS TIMESTAMP) AS ts,
         'prompt' AS kind,
-        json_extract_string(json, '$.message.content') AS text
+        {_json_str("json", "$.message.content")} AS text
     FROM raw
-    WHERE json_extract_string(json, '$.type') = 'user'
+    WHERE json_type(json) = 'OBJECT'
+      AND {_json_str("json", "$.type")} = 'user'
       AND json_type(json->'$.message.content') = 'VARCHAR'
     UNION ALL
     SELECT
-        json_extract_string(json, '$.sessionId'),
+        {_json_str("json", "$.sessionId")},
         NULL, NULL, 'title',
-        json_extract_string(json, '$.aiTitle')
+        {_json_str("json", "$.aiTitle")}
     FROM raw
-    WHERE json_extract_string(json, '$.type') = 'ai-title'
+    WHERE json_type(json) = 'OBJECT'
+      AND {_json_str("json", "$.type")} = 'ai-title'
 )
 WHERE text IS NOT NULL AND length(trim(text)) > 0;
 """
@@ -277,21 +344,9 @@ _MATERIALIZED = (
 def _install_relations(con: duckdb.DuckDBPyConnection, projects_dir: Path | str) -> None:
     """Create the `raw` view, the pricing table, and all derived views on *con*."""
     # read_ndjson_objects raises on a zero-match glob, so fall back to an empty
-    # typed relation when there are no transcripts yet (fresh machine / empty dir).
-    matches = list(Path(projects_dir).glob("*/*.jsonl"))
-    if matches:
-        # The glob is operator-controlled config (not user input); inline it with
-        # quote-escaping since DuckDB cannot bind a prepared parameter inside DDL.
-        glob_literal = _glob(Path(projects_dir)).replace("'", "''")
-        con.execute(
-            "CREATE VIEW raw AS SELECT filename, json FROM "
-            f"read_ndjson_objects('{glob_literal}', filename=true, ignore_errors=true)"
-        )
-    else:
-        con.execute(
-            "CREATE VIEW raw AS SELECT * FROM "
-            "(SELECT NULL::VARCHAR AS filename, NULL::JSON AS json) WHERE false"
-        )
+    # typed relation when there are no readable transcripts yet (fresh machine /
+    # empty dir / unreadable files).
+    _create_raw_view(con, projects_dir)
     con.execute("CREATE TABLE model_pricing (model VARCHAR, in_price DOUBLE, out_price DOUBLE)")
     con.executemany("INSERT INTO model_pricing VALUES (?, ?, ?)", pricing_rows())
     con.execute(_views_sql())
@@ -382,7 +437,18 @@ def is_cache_stale(
         built = path.stat().st_mtime
     except FileNotFoundError:
         return True
-    return any(p.stat().st_mtime > built for p in Path(projects_dir).glob("*/*.jsonl"))
+    try:
+        found = Path(projects_dir).glob("*/*.jsonl")
+    except OSError:
+        return True
+    for src in found:
+        try:
+            if src.stat().st_mtime > built:
+                return True
+        except OSError:
+            # Vanished or dangling source: treat as stale rather than crashing.
+            return True
+    return False
 
 
 def _scan_string_literal(sql: str, i: int) -> int:
