@@ -7,18 +7,14 @@ from __future__ import annotations
 
 import json
 import os
-from typing import TYPE_CHECKING
+from pathlib import Path
 
+import duckdb
 import pytest
 from click.testing import CliRunner
 
 from ccq.cli import cli
 from ccq.db import build_cache, connect, connect_fast, is_cache_stale
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import duckdb
 
 _PUBLIC_VIEWS = (
     "events",
@@ -320,6 +316,71 @@ def test_cache_and_staleness_tolerate_malformed_and_dangling(tmp_path: Path) -> 
         con.close()
 
     (tmp_path / "proj" / "gone.jsonl").symlink_to(tmp_path / "missing.jsonl")
+    assert is_cache_stale(cache, tmp_path) is True
+
+
+def test_unlistable_dir_uses_empty_views(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(self: Path, pattern: str) -> list[Path]:  # noqa: ARG001
+        raise OSError
+
+    monkeypatch.setattr("ccq.db.Path.glob", boom)
+    con = connect(tmp_path)
+    try:
+        _query_all_views(con)
+        assert con.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_stat_oserror_on_jsonl_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_jsonl(tmp_path, "ok.jsonl", [_VALID_USER])
+    original = Path.is_file
+
+    def boom(self: Path) -> bool:
+        if self.suffix == ".jsonl":
+            raise OSError
+        return original(self)
+
+    monkeypatch.setattr("ccq.db.Path.is_file", boom)
+    con = connect(tmp_path)
+    try:
+        _query_all_views(con)
+        assert con.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_scan_ioexception_falls_back_to_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_jsonl(tmp_path, "ok.jsonl", [_VALID_USER])
+    original = duckdb.DuckDBPyConnection.execute
+
+    def execute(self: duckdb.DuckDBPyConnection, *args: object, **kwargs: object) -> object:
+        sql = args[0] if args else ""
+        if isinstance(sql, str) and "read_ndjson_objects" in sql:
+            raise duckdb.IOException
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(duckdb.DuckDBPyConnection, "execute", execute)
+    con = connect(tmp_path)
+    try:
+        _query_all_views(con)
+        assert con.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_is_cache_stale_unlistable_dir_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "ccq.duckdb"
+    cache.write_bytes(b"not-a-real-snapshot")
+
+    def boom(self: Path, pattern: str) -> list[Path]:  # noqa: ARG001
+        raise OSError
+
+    monkeypatch.setattr("ccq.db.Path.glob", boom)
     assert is_cache_stale(cache, tmp_path) is True
 
 
